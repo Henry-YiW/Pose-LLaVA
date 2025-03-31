@@ -46,7 +46,7 @@ def create_conversation_data(pose_data, action_mapping):
             "y": sample['y'].tolist(),
             "visibility": sample['visibility'].tolist(),
             "bbox": sample['bbox'].tolist(),
-            'nframes': sample['nframes'],
+            'nframes': int(sample['nframes']),
             "conversations": [
                 {
                     "from": "human",
@@ -122,6 +122,8 @@ def main(train_data_path, mapping_path, output_dir, val_data_path=None):
         f.write("- `x`: X-coordinates of pose keypoints (76 frames, 13 keypoints)\n")
         f.write("- `y`: Y-coordinates of pose keypoints (76 frames, 13 keypoints)\n")
         f.write("- `visibility`: Visibility flags for keypoints\n")
+        f.write("- `bbox`: Bounding box of the pose\n")
+        f.write("- `nframes`: Number of frames in the pose sequence\n")
         f.write("- `conversations`: Conversation format for training\n\n")
         
         f.write("## Actions\n\n")

@@ -3,10 +3,15 @@
 # This script processes .mat files and trains the Pose-LLaVA model
 
 # Define paths
+# MAT_DIR="./labels"  # Directory containing .mat files
+# PROCESSED_DIR="./llava/processed_data"  # Directory for processed data
+# OUTPUT_DIR="./llava/pose_llava_data"  # Directory for training data
+# MODEL_OUTPUT_DIR="./llava/checkpoints/pose-llava-7b"  # Directory for trained model
+
 MAT_DIR="./labels"  # Directory containing .mat files
-PROCESSED_DIR="./llava/processed_data"  # Directory for processed data
-OUTPUT_DIR="./llava/pose_llava_data"  # Directory for training data
-MODEL_OUTPUT_DIR="./llava/checkpoints/pose-llava-7b"  # Directory for trained model
+PROCESSED_DIR="./processed_data"  # Directory for processed data
+OUTPUT_DIR="./pose_llava_data"  # Directory for training data
+MODEL_OUTPUT_DIR="./checkpoints/pose-llava-7b"  # Directory for trained model
 
 # Create directories
 mkdir -p $PROCESSED_DIR
