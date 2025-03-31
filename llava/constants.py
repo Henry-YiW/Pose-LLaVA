@@ -6,6 +6,14 @@ LOGDIR = "."
 # Model Constants
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = -200
+POSE_TOKEN_INDEX = -201
+
+DEFAULT_POSE_TOKEN = "<pose>"
+DEFAULT_POSE_PATCH_TOKEN = "<pose_patch>"
+DEFAULT_POSE_START_TOKEN = "<pose_start>"
+DEFAULT_POSE_END_TOKEN = "<pose_end>"
+POSE_PLACEHOLDER = "<pose-placeholder>"
+
 DEFAULT_IMAGE_TOKEN = "<image>"
 DEFAULT_IMAGE_PATCH_TOKEN = "<im_patch>"
 DEFAULT_IM_START_TOKEN = "<im_start>"
