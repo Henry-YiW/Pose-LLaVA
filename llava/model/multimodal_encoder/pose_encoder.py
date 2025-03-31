@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import re
@@ -33,21 +34,40 @@ class SimpleResBlock(nn.Module):
 
 
 class MLPPoseTower(nn.Module):
-    def __init__(self, hidden_dim: int, num_joints: int, num_frames: int, use_joint_type=False):
+    def __init__(self, hidden_dim: int, num_joints: int, max_frames: int, use_joint_type=False):
         super().__init__()
         self.input_dim = 6  # (x, y, xmin, ymin, xmax, ymax)
         self.hidden_dim = hidden_dim
         self.num_joints = num_joints
-        self.num_frames = num_frames
+        self.max_frames = max_frames
         self.use_joint_type = use_joint_type
 
         # Pose projector (MLP)
-        self.net = nn.Sequential(
-            nn.Linear(self.input_dim, 128),
+        self.joint_net = nn.Sequential(
+            nn.Linear(self.input_dim, 18),
             nn.GELU(),
-            nn.Linear(128, 512),
+            nn.Linear(18, 54)
+        )
+
+        # self.frame_net = nn.Sequential(
+        #     nn.Linear(self.input_dim, 24),
+        #     nn.GELU(),
+        #     nn.Linear(24, 96),
+        #     nn.GELU(),
+        #     nn.Linear(96, 384)
+        # )
+
+        # self.frame_net = nn.TransformerEncoder(
+        #     nn.TransformerEncoderLayer(96 * num_joints, nhead=8),
+        #     num_layers=3
+        # )
+
+        self.frame_net = nn.Sequential(
+            nn.Linear(54 * num_joints, 1404),
             nn.GELU(),
-            nn.Linear(512, hidden_dim)
+            nn.Linear(1404, 2808),
+            nn.GELU(),
+            nn.Linear(2808, hidden_dim)
         )
 
         # Learnable mask token for invisible joints
@@ -55,13 +75,26 @@ class MLPPoseTower(nn.Module):
         nn.init.xavier_uniform_(self.mask_token)
 
         # Positional encodings
-        self.joint_index_embed = nn.Parameter(torch.randn(1, 1, num_joints, hidden_dim))  # (1, 1, J, H)
-        self.frame_index_embed = nn.Parameter(torch.randn(1, num_frames, 1, hidden_dim))  # (1, F, 1, H)
+        # non-learnable emdding would provide generalization to unseen joints
+        # self.joint_index_embed = nn.Parameter(torch.randn(1, 1, num_joints, hidden_dim))  # (1, 1, J, H)
+        # self.frame_index_embed = nn.Parameter(torch.randn(1, max_frames, 1, hidden_dim))  # (1, F, 1, H)
+
+        self.register_buffer("frame_index_embed", self.build_sinusoidal_embedding(max_frames, hidden_dim))
+        self.register_buffer("joint_index_embed", self.build_sinusoidal_embedding(num_joints, hidden_dim))
+
 
         if use_joint_type:
             # Optional joint type embedding (e.g., hand vs foot)
             self.joint_type_embed = nn.Embedding(num_joints, hidden_dim)
 
+    def build_sinusoidal_embedding(self, num_positions: int, dim: int):
+        position = torch.arange(num_positions).unsqueeze(1)  # (num_positions, 1)
+        div_term = torch.exp(torch.arange(0, dim, 2) * (-math.log(10000.0) / dim))
+        pe = torch.zeros(num_positions, dim)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe.view(1, num_positions, dim)  # shape: (1, F, D)
+    
     def forward(self, pose_with_bbox: torch.Tensor, visibility: torch.Tensor):
         """
         pose_with_bbox: (B, F, J, 6) - (x, y, xmin, ymin, xmax, ymax)
@@ -73,11 +106,6 @@ class MLPPoseTower(nn.Module):
         # Project pose to hidden_dim
         pose_embed = self.net(pose_with_bbox)  # (B, F, J, hidden_dim)
 
-        # Base joint and frame position embeddings
-        joint_pos = self.joint_index_embed[:, :, :J, :]           # (1, 1, J, H)
-        frame_pos = self.frame_index_embed[:, :F, :, :]          # (1, F, 1, H)
-        pose_embed = pose_embed + joint_pos + frame_pos
-
         if self.use_joint_type:
             # Treat joint index as type for embedding
             joint_ids = torch.arange(J, device=pose_embed.device).view(1, 1, J).expand(B, F, J)
@@ -88,8 +116,15 @@ class MLPPoseTower(nn.Module):
         mask = self.mask_token.expand(B, F, J, -1)               # (B, F, J, H)
         pose_embed = torch.where(visibility.unsqueeze(-1).bool(), pose_embed, mask)
 
-        pose_embed = pose_embed.reshape(B, F * J, -1)
-        return pose_embed  # (B, F, J, hidden_dim)
+        pose_embed = pose_embed.reshape(B, F, -1)
+
+        pose_embed = self.frame_net(pose_embed)
+
+        # Base frame position embeddings
+        frame_pos = self.frame_index_embed[:, :F, :]          # (1, F, H)
+        pose_embed = pose_embed + frame_pos
+
+        return pose_embed  # (B, F, hidden_dim)
 
 
 
@@ -156,25 +191,48 @@ class GATLayer(nn.Module):
 
 
 class PoseGCNProjector(nn.Module):
-    def __init__(self, hidden_dim, A, using_gat=False):
+    def __init__(self, hidden_dim, A, max_frames, num_joints, using_gat=False):
         super().__init__()
         self.A = A
 
-        self.linear = nn.Sequential(nn.Linear(6, 64), nn.GELU(), nn.Linear(64, 32))
+        self.linear = nn.Sequential(nn.Linear(6, 12), nn.GELU(), nn.Linear(12, 24))
         if using_gat:
-            self.gcn1 = GATLayer(32, 128)
-            self.gcn2 = GATLayer(128, 512)
-            self.gcn3 = GATLayer(512, 2048)
+            self.gcn1 = GATLayer(24, 48)
+            self.gcn2 = GATLayer(48, 96)
+            self.gcn3 = GATLayer(96, 192)
         else:
-            self.gcn1 = GCNLayer(32, 128)
-            self.gcn2 = GCNLayer(128, 512)
-            self.gcn3 = GCNLayer(512, 2048)
+            self.gcn1 = GCNLayer(24, 48)
+            self.gcn2 = GCNLayer(48, 96)
+            self.gcn3 = GCNLayer(96, 192)
 
-        self.output_linear = nn.Linear(2048, hidden_dim)
+        self.frame_net = nn.Sequential(
+            nn.Linear(192 * num_joints, 2496 * 2),
+            nn.GELU(),
+            nn.Linear(2496 * 2, 2496),
+            nn.GELU(),
+            nn.Linear(2496, hidden_dim)
+        )
         
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, 32))
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, 24))
         nn.init.xavier_uniform_(self.mask_token)
 
+
+        # Positional encodings
+        # non-learnable emdding would provide generalization to unseen joints
+        # self.joint_index_embed = nn.Parameter(torch.randn(1, 1, num_joints, hidden_dim))  # (1, 1, J, H)
+        # self.frame_index_embed = nn.Parameter(torch.randn(1, max_frames, 1, hidden_dim))  # (1, F, 1, H)
+
+        self.register_buffer("frame_index_embed", self.build_sinusoidal_embedding(max_frames, hidden_dim))
+        self.register_buffer("joint_index_embed", self.build_sinusoidal_embedding(num_joints, hidden_dim))
+
+    def build_sinusoidal_embedding(self, num_positions: int, dim: int):
+        position = torch.arange(num_positions).unsqueeze(1)  # (num_positions, 1)
+        div_term = torch.exp(torch.arange(0, dim, 2) * (-math.log(10000.0) / dim))
+        pe = torch.zeros(num_positions, dim)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe.view(1, num_positions, dim)  # shape: (1, F, D)
+    
     def forward(self, pose_with_bbox, visibility):
         B, F, J, _ = pose_with_bbox.shape
         # v = visibility[:, t].unsqueeze(-1)
@@ -189,9 +247,10 @@ class PoseGCNProjector(nn.Module):
         x = F.gelu(x)
         x = self.gcn3(x, self.A)
         x = F.gelu(x)
-        x = self.output_linear(x)
         B, F, J, _ = x.shape
-        x = x.reshape(B, F * J, -1)
+        x = x.reshape(B, F, -1)
+        x = self.frame_net(x)
+        x = x + self.frame_index_embed[:, :F, :]
         return x
 
 
@@ -242,19 +301,43 @@ class STGCNLayer(nn.Module):
 
 
 class PoseSTGCNProjector(nn.Module):
-    def __init__(self, hidden_dim, A, using_gat=False, richer_frequency_representation=False):
+    def __init__(self, hidden_dim, A, max_frames, num_joints, using_gat=False, richer_frequency_representation=False):
         super().__init__()
         self.A = A
-        self.linear = nn.Sequential(nn.Linear(6, 64), nn.GELU(), nn.Linear(64, 32))
-        self.stgcn1 = STGCNLayer(32, 128, using_gat=using_gat, richer_frequency_representation=richer_frequency_representation)
-        self.stgcn2 = STGCNLayer(128, 512, using_gat=using_gat, richer_frequency_representation=richer_frequency_representation)
-        self.stgcn3 = STGCNLayer(512, 2048, using_gat=using_gat, richer_frequency_representation=richer_frequency_representation)
-        self.output_linear = nn.Linear(2048, hidden_dim)
+        self.linear = nn.Sequential(nn.Linear(6, 12), nn.GELU(), nn.Linear(12, 24))
+        self.stgcn1 = STGCNLayer(24, 48, using_gat=using_gat, richer_frequency_representation=richer_frequency_representation)
+        self.stgcn2 = STGCNLayer(48, 96, using_gat=using_gat, richer_frequency_representation=richer_frequency_representation)
+        self.stgcn3 = STGCNLayer(96, 192, using_gat=using_gat, richer_frequency_representation=richer_frequency_representation)
+        
+        self.frame_net = nn.Sequential(
+            nn.Linear(192 * num_joints, 2496 * 2),
+            nn.GELU(),
+            nn.Linear(2496 * 2, 2496),
+            nn.GELU(),
+            nn.Linear(2496, hidden_dim)
+        )
 
 
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, 32))
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, 24))
         nn.init.xavier_uniform_(self.mask_token)
 
+
+        # Positional encodings
+        # non-learnable emdding would provide generalization to unseen joints
+        # self.joint_index_embed = nn.Parameter(torch.randn(1, 1, num_joints, hidden_dim))  # (1, 1, J, H)
+        # self.frame_index_embed = nn.Parameter(torch.randn(1, max_frames, 1, hidden_dim))  # (1, F, 1, H)
+
+        self.register_buffer("frame_index_embed", self.build_sinusoidal_embedding(max_frames, hidden_dim))
+        self.register_buffer("joint_index_embed", self.build_sinusoidal_embedding(num_joints, hidden_dim))
+
+    def build_sinusoidal_embedding(self, num_positions: int, dim: int):
+        position = torch.arange(num_positions).unsqueeze(1)  # (num_positions, 1)
+        div_term = torch.exp(torch.arange(0, dim, 2) * (-math.log(10000.0) / dim))
+        pe = torch.zeros(num_positions, dim)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe.view(1, num_positions, dim)  # shape: (1, F, D)
+    
     def forward(self, pose_with_bbox, visibility):
         B, F, J, C = pose_with_bbox.shape
         # x = pose_with_bbox * visibility.unsqueeze(-1)
@@ -268,7 +351,8 @@ class PoseSTGCNProjector(nn.Module):
         x = F.gelu(x)
         x = self.stgcn3(x, self.A)
         x = F.gelu(x)
-        x = self.output_linear(x)
         B, F, J, C = x.shape
-        x = x.reshape(B, F * J, C)
+        x = x.reshape(B, F, -1)
+        x = self.frame_net(x)
+        x = x + self.frame_index_embed[:, :F, :]
         return x

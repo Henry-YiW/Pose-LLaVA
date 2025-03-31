@@ -773,6 +773,22 @@ class LazySupervisedDatasetUsingHuggingFace(Dataset):
 
     
     def build_penn_action_adj(self):
+        '''
+        Index	Joint Name
+        0	    Head
+        1	    Left Shoulder
+        2	    Right Shoulder
+        3	    Left Elbow
+        4	    Right Elbow
+        5	    Left Wrist
+        6	    Right Wrist
+        7	    Left Hip
+        8	    Right Hip
+        9	    Left Knee
+        10	    Right Knee
+        11	    Left Ankle
+        12	    Right Ankle
+        '''
         num_joints = 13
         edges = [
             (0, 1), (0, 2),       # head ↔ shoulders
@@ -859,7 +875,12 @@ class LazySupervisedDatasetUsingHuggingFace(Dataset):
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
         elif 'x' in self.list_data_dict[i]:
-            data_dict['pose'] = torch.stack([torch.tensor(self.list_data_dict[i]['x'], dtype=torch.float32), torch.tensor(self.list_data_dict[i]['y'], dtype=torch.float32)], dim=-1)
+            datum = self.list_data_dict[i]
+            bboxData = torch.tensor(datum['bbox'], dtype=torch.float32)
+            bboxData = bboxData.unsqueeze(1).expand(datum['x'].shape[0], datum['x'].shape[1], -1)
+            data_dict['pose'] = torch.stack([torch.tensor(datum['x'], dtype=torch.float32), torch.tensor(datum['y'], dtype=torch.float32)], dim=-1)
+            data_dict['pose'] = torch.cat([data_dict['pose'], bboxData], dim=-1)
+            data_dict['visibility'] = torch.tensor(datum['visibility'], dtype=torch.int32)
             print('pose shape from dataset loader:', data_dict['pose'].shape)
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
