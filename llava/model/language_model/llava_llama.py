@@ -68,10 +68,14 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         poses: Optional[torch.FloatTensor] = None,
+        visibilities: Optional[torch.FloatTensor] = None,
+        pose_attention_mask: Optional[torch.LongTensor] = None,
         return_dict: Optional[bool] = None,
+        *args,
+        **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-
-        if inputs_embeds is None:
+        # print('inputs_embeds from LlavaLlamaForCausalLM forward:', inputs_embeds.shape)
+        if inputs_embeds is None and past_key_values is None:
             if images is not None:
                 (
                     input_ids,
@@ -90,24 +94,30 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     image_sizes
                 )
             elif poses is not None:
+                # print('to prepare_inputs_labels_for_multimodal_pose!!!!!!!!!!')
                 (
                     input_ids,
                     position_ids,
                     attention_mask,
                     past_key_values,
                     inputs_embeds,
-                labels
+                    labels
                 ) = self.prepare_inputs_labels_for_multimodal_pose(
                     input_ids,
                     position_ids,
                     attention_mask,
                     past_key_values,
                     labels,
-                    poses
+                    poses,
+                    visibilities,
+                    pose_attention_mask
                 )
             else:
                 raise ValueError("Either images or poses must be provided")
-
+        # if debug_input_ids(input_ids, self.tokenizer.vocab_size):
+        #     raise ValueError("Invalid token IDs found in input_ids")
+        # print('inputs_embeds from LlavaLlamaForCausalLM forward: 2', inputs_embeds.shape)
+        # print('use_cache', use_cache)
         return super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -128,6 +138,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.Tensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
         poses: Optional[torch.Tensor] = None,
+        visibilities: Optional[torch.FloatTensor] = None,
+        pose_attention_mask: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         position_ids = kwargs.pop("position_ids", None)
@@ -166,11 +178,14 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 attention_mask,
                 None,
                 None,
-                poses
+                poses,
+                visibilities,
+                pose_attention_mask
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
 
+        print('inputs_embeds from LlavaLlamaForCausalLM generate: 2-----', inputs_embeds.shape)
         return super().generate(
             position_ids=position_ids,
             attention_mask=attention_mask,

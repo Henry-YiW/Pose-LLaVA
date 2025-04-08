@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import re
 
-import torch.nn.functional as F
+import torch.nn.functional as TorchF
 
 class IdentityMap(nn.Module):
     def __init__(self):
@@ -42,11 +42,13 @@ class MLPPoseTower(nn.Module):
         self.max_frames = max_frames
         self.use_joint_type = use_joint_type
 
+        self.intermediate_dim = 54
+
         # Pose projector (MLP)
         self.joint_net = nn.Sequential(
             nn.Linear(self.input_dim, 18),
             nn.GELU(),
-            nn.Linear(18, 54)
+            nn.Linear(18, self.intermediate_dim)
         )
 
         # self.frame_net = nn.Sequential(
@@ -63,7 +65,7 @@ class MLPPoseTower(nn.Module):
         # )
 
         self.frame_net = nn.Sequential(
-            nn.Linear(54 * num_joints, 1404),
+            nn.Linear(self.intermediate_dim * num_joints, 1404),
             nn.GELU(),
             nn.Linear(1404, 2808),
             nn.GELU(),
@@ -71,7 +73,7 @@ class MLPPoseTower(nn.Module):
         )
 
         # Learnable mask token for invisible joints
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, hidden_dim))
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, self.intermediate_dim))
         nn.init.xavier_uniform_(self.mask_token)
 
         # Positional encodings
@@ -100,11 +102,17 @@ class MLPPoseTower(nn.Module):
         pose_with_bbox: (B, F, J, 6) - (x, y, xmin, ymin, xmax, ymax)
         visibility:     (B, F, J)
         """
+        # print('pose_with_bbox', pose_with_bbox)
+        # print('pose_with_bbox length', len(pose_with_bbox))
         B, F, J, _ = pose_with_bbox.shape
-        assert J == self.num_joints and F <= self.num_frames
-
+        try:
+            assert J == self.num_joints and F <= self.max_frames
+        except Exception as e:
+            print('Exepected Max Frames:', self.max_frames, 'Actual Max Frames:', F)
+            raise e
+        pose_with_bbox = pose_with_bbox.to(dtype=self.joint_net[0].weight.dtype)
         # Project pose to hidden_dim
-        pose_embed = self.net(pose_with_bbox)  # (B, F, J, hidden_dim)
+        pose_embed = self.joint_net(pose_with_bbox)  # (B, F, J, hidden_dim)
 
         if self.use_joint_type:
             # Treat joint index as type for embedding
@@ -115,6 +123,8 @@ class MLPPoseTower(nn.Module):
         # Apply visibility masking
         mask = self.mask_token.expand(B, F, J, -1)               # (B, F, J, H)
         pose_embed = torch.where(visibility.unsqueeze(-1).bool(), pose_embed, mask)
+
+        # Check if the pose_embed is right
 
         pose_embed = pose_embed.reshape(B, F, -1)
 
@@ -145,6 +155,7 @@ class GCNLayer(nn.Module):
         else:
             A_eff = A
 
+        A_eff = A_eff.to(x.device)
         x = torch.matmul(x, A_eff)  # (B, F, C, J)
         x = x.permute(0, 1, 3, 2)   # (B, F, J, C)
         x = self.linear(x)          # linear over last dim
@@ -190,20 +201,22 @@ class GATLayer(nn.Module):
         return out
 
 
-class PoseGCNProjector(nn.Module):
+class GCNPower(nn.Module):
     def __init__(self, hidden_dim, A, max_frames, num_joints, using_gat=False):
         super().__init__()
         self.A = A
-
+        self.hidden_dim = hidden_dim
+        self.num_joints = num_joints
+        self.max_frames = max_frames
         self.linear = nn.Sequential(nn.Linear(6, 12), nn.GELU(), nn.Linear(12, 24))
         if using_gat:
             self.gcn1 = GATLayer(24, 48)
             self.gcn2 = GATLayer(48, 96)
             self.gcn3 = GATLayer(96, 192)
         else:
-            self.gcn1 = GCNLayer(24, 48)
-            self.gcn2 = GCNLayer(48, 96)
-            self.gcn3 = GCNLayer(96, 192)
+            self.gcn1 = GCNLayer(24, 48, num_joints)
+            self.gcn2 = GCNLayer(48, 96, num_joints)
+            self.gcn3 = GCNLayer(96, 192, num_joints)
 
         self.frame_net = nn.Sequential(
             nn.Linear(192 * num_joints, 2496 * 2),
@@ -234,19 +247,23 @@ class PoseGCNProjector(nn.Module):
         return pe.view(1, num_positions, dim)  # shape: (1, F, D)
     
     def forward(self, pose_with_bbox, visibility):
+        pose_with_bbox = pose_with_bbox.to(dtype=self.linear[0].weight.dtype)
         B, F, J, _ = pose_with_bbox.shape
         # v = visibility[:, t].unsqueeze(-1)
         # x = x * v
         x = self.linear(pose_with_bbox)
-        mask = self.mask_token.expand(B, J, F, -1)
+        # print('x shape', x.shape)
+        # print('visibility shape', visibility.shape)
+        # print('mask shape', self.mask_token.shape)
+        mask = self.mask_token.expand(B, F, J, -1)
         x = torch.where(visibility.unsqueeze(-1).bool(), x, mask)
-        x = F.gelu(x)
+        x = TorchF.gelu(x)
         x = self.gcn1(x, self.A)
-        x = F.gelu(x)
+        x = TorchF.gelu(x)
         x = self.gcn2(x, self.A)
-        x = F.gelu(x)
+        x = TorchF.gelu(x)
         x = self.gcn3(x, self.A)
-        x = F.gelu(x)
+        x = TorchF.gelu(x)
         B, F, J, _ = x.shape
         x = x.reshape(B, F, -1)
         x = self.frame_net(x)
@@ -255,7 +272,7 @@ class PoseGCNProjector(nn.Module):
 
 
 class STGCNLayer(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, using_gat=False, richer_frequency_representation=False):
+    def __init__(self, in_channels, out_channels, num_joints, kernel_size=3, using_gat=False, richer_frequency_representation=False):
         super().__init__()
         in_channels_for_spatial_gcn = in_channels
         out_channels_for_spatial_gcn = out_channels
@@ -271,7 +288,7 @@ class STGCNLayer(nn.Module):
         if using_gat:
             self.spatial_gcn = GATLayer(in_channels_for_spatial_gcn, out_channels_for_spatial_gcn)
         else:
-            self.spatial_gcn = GCNLayer(in_channels_for_spatial_gcn, out_channels_for_spatial_gcn)
+            self.spatial_gcn = GCNLayer(in_channels_for_spatial_gcn, out_channels_for_spatial_gcn, num_joints)
         self.temporal_conv = nn.Conv2d(in_channels_for_temporal_conv, out_channels_for_temporal_conv, (kernel_size, 1), padding=(kernel_size // 2, 0))
         self.bn = nn.BatchNorm2d(out_channels_for_temporal_conv)
         self.using_gat = using_gat
@@ -291,7 +308,7 @@ class STGCNLayer(nn.Module):
 
         x = self.spatial_gcn(x, A) # x (B, F, J, C)
         x = x.permute(0, 3, 1, 2).contiguous() # x (B, C, F, J)
-        x = F.gelu(x)
+        x = TorchF.gelu(x)
         x = self.temporal_conv(x)
         x = self.bn(x)
 
@@ -300,14 +317,17 @@ class STGCNLayer(nn.Module):
         return x
 
 
-class PoseSTGCNProjector(nn.Module):
+class STGCNPower(nn.Module):
     def __init__(self, hidden_dim, A, max_frames, num_joints, using_gat=False, richer_frequency_representation=False):
         super().__init__()
         self.A = A
+        self.hidden_dim = hidden_dim
+        self.num_joints = num_joints
+        self.max_frames = max_frames
         self.linear = nn.Sequential(nn.Linear(6, 12), nn.GELU(), nn.Linear(12, 24))
-        self.stgcn1 = STGCNLayer(24, 48, using_gat=using_gat, richer_frequency_representation=richer_frequency_representation)
-        self.stgcn2 = STGCNLayer(48, 96, using_gat=using_gat, richer_frequency_representation=richer_frequency_representation)
-        self.stgcn3 = STGCNLayer(96, 192, using_gat=using_gat, richer_frequency_representation=richer_frequency_representation)
+        self.stgcn1 = STGCNLayer(24, 48, num_joints, kernel_size=3, using_gat=using_gat, richer_frequency_representation=richer_frequency_representation)
+        self.stgcn2 = STGCNLayer(48, 96, num_joints, kernel_size=3, using_gat=using_gat, richer_frequency_representation=richer_frequency_representation)
+        self.stgcn3 = STGCNLayer(96, 192, num_joints, kernel_size=3, using_gat=using_gat, richer_frequency_representation=richer_frequency_representation)
         
         self.frame_net = nn.Sequential(
             nn.Linear(192 * num_joints, 2496 * 2),
@@ -339,18 +359,22 @@ class PoseSTGCNProjector(nn.Module):
         return pe.view(1, num_positions, dim)  # shape: (1, F, D)
     
     def forward(self, pose_with_bbox, visibility):
+        pose_with_bbox = pose_with_bbox.to(dtype=self.linear[0].weight.dtype)
         B, F, J, C = pose_with_bbox.shape
         # x = pose_with_bbox * visibility.unsqueeze(-1)
         x = self.linear(pose_with_bbox)
-        mask = self.mask_token.expand(B, J, F, -1)
+        # print('x shape', x.shape)
+        # print('visibility shape', visibility.shape)
+        # print('mask shape', self.mask_token.shape)
+        mask = self.mask_token.expand(B, F, J, -1)
         x = torch.where(visibility.unsqueeze(-1).bool(), x, mask)
-        x = F.gelu(x)
+        x = TorchF.gelu(x)
         x = self.stgcn1(x, self.A)
-        x = F.gelu(x)
+        x = TorchF.gelu(x)
         x = self.stgcn2(x, self.A)
-        x = F.gelu(x)
+        x = TorchF.gelu(x)
         x = self.stgcn3(x, self.A)
-        x = F.gelu(x)
+        x = TorchF.gelu(x)
         B, F, J, C = x.shape
         x = x.reshape(B, F, -1)
         x = self.frame_net(x)

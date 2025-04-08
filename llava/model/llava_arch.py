@@ -40,8 +40,8 @@ class LlavaMetaModel:
                     torch.empty(config.hidden_size, dtype=self.dtype)
                 )
 
-        if hasattr(config, "mm_pose_tower"):
-            self.pose_tower = build_pose_tower(config, delay_load=True)
+        if hasattr(config, "pose_tower"):
+            self.pose_tower = build_pose_tower(config)
             self.mm_pose_projector = build_pose_projector(config)
 
     def get_vision_tower(self):
@@ -109,10 +109,10 @@ class LlavaMetaModel:
 
     def initialize_pose_modules(self, model_args, fsdp=None):
         pose_tower = model_args.pose_tower
-        mm_pose_select_layer = model_args.mm_pose_select_layer
-        mm_pose_select_feature = model_args.mm_pose_select_feature
-        pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter
-        mm_patch_merge_type = model_args.mm_patch_merge_type
+        # mm_pose_select_layer = model_args.mm_pose_select_layer
+        # mm_pose_select_feature = model_args.mm_pose_select_feature
+        # pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter
+        # mm_patch_merge_type = model_args.mm_patch_merge_type
 
         self.config.mm_pose_tower = pose_tower
 
@@ -130,33 +130,33 @@ class LlavaMetaModel:
                 pose_tower = self.pose_tower
             pose_tower.load_model()
 
-        self.config.use_mm_proj = True
-        self.config.mm_projector_type = getattr(model_args, 'mm_projector_type', 'linear')
-        self.config.mm_hidden_size = pose_tower.hidden_size
-        self.config.mm_pose_select_layer = mm_pose_select_layer
-        self.config.mm_pose_select_feature = mm_pose_select_feature
-        self.config.mm_patch_merge_type = mm_patch_merge_type
+        # self.config.use_mm_proj = True
+        # self.config.mm_projector_type = getattr(model_args, 'mm_projector_type', 'linear')
+        self.config.mm_hidden_size = pose_tower.hidden_dim
+        # self.config.mm_pose_select_layer = mm_pose_select_layer
+        # self.config.mm_pose_select_feature = mm_pose_select_feature
+        # self.config.mm_patch_merge_type = mm_patch_merge_type
 
-        if getattr(self, 'mm_pose_projector', None) is None:
-            self.mm_pose_projector = build_pose_projector(self.config)
+        # if getattr(self, 'mm_pose_projector', None) is None:
+        #     self.mm_pose_projector = build_pose_projector(self.config)
 
-            if 'unpad' in mm_patch_merge_type:
-                embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
-                self.pose_newline = nn.Parameter(
-                    torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std
-                )
-        else:
-            # In case it is frozen by LoRA
-            for p in self.mm_pose_projector.parameters():
-                p.requires_grad = True
+        #     if 'unpad' in mm_patch_merge_type:
+        #         embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
+        #         self.pose_newline = nn.Parameter(
+        #             torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std
+        #         )
+        # else:
+        #     # In case it is frozen by LoRA
+        #     for p in self.mm_pose_projector.parameters():
+        #         p.requires_grad = True
 
-        if pretrain_mm_mlp_adapter is not None:
-            mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
-            def get_w(weights, keyword):
-                return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
+        # if pretrain_mm_mlp_adapter is not None:
+        #     mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
+        #     def get_w(weights, keyword):
+        #         return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
 
-            self.mm_pose_projector.load_state_dict(get_w(mm_projector_weights, 'mm_pose_projector'))
-
+        #     self.mm_pose_projector.load_state_dict(get_w(mm_projector_weights, 'mm_pose_projector'))
+        print('pose power', pose_tower.__class__)
 
 def unpad_image(tensor, original_size):
     """
@@ -206,9 +206,10 @@ class LlavaMetaForCausalLM(ABC):
         image_features = self.get_model().mm_projector(image_features)
         return image_features
     
-    def encode_poses(self, poses):
-        pose_features = self.get_model().get_pose_tower()(poses)
-        pose_features = self.get_model().mm_pose_projector(pose_features)
+    def encode_poses(self, poses, visibilities):
+        pose_features = self.get_model().get_pose_tower()(poses, visibilities)
+        if hasattr(self.get_model(), "mm_pose_projector") and self.get_model().mm_pose_projector is not None:
+            pose_features = self.get_model().mm_pose_projector(pose_features)
         return pose_features
 
     def prepare_inputs_labels_for_multimodal(
@@ -394,13 +395,15 @@ class LlavaMetaForCausalLM(ABC):
     
     def prepare_inputs_labels_for_multimodal_pose(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        poses
+        poses, visibilities, pose_attention_mask
     ):
+        # print('input_ids typ 2', type(input_ids))
         pose_tower = self.get_pose_tower()
         if pose_tower is None or poses is None or input_ids.shape[1] == 1:
+            print('pose_tower is None or poses is None or input_ids.shape[1] == 1')
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
-        pose_features = self.encode_poses(poses)
+        pose_features = self.encode_poses(poses, visibilities if visibilities is not None else torch.ones(poses.shape[0], poses.shape[1], poses.shape[2], device=poses.device))
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -431,8 +434,17 @@ class LlavaMetaForCausalLM(ABC):
         new_labels = []
         cur_pose_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
-            num_poses = (cur_input_ids == POSE_TOKEN_INDEX).sum()
-            if num_poses == 0:
+            # num_poses = (cur_input_ids == POSE_TOKEN_INDEX).sum()
+            num_pose_frames = pose_attention_mask[batch_idx].sum() if pose_attention_mask is not None else poses.shape[1]
+            # print('num_pose_frames:', 'batch_idx:', batch_idx, 'num_pose_frames:', num_pose_frames)
+            # i = 0
+            # while i < poses.shape[1]:
+            #     if poses[batch_idx, i, 0, 0] == IGNORE_INDEX:
+            #         break
+            #     i += 1
+            # print('pose_features shape:', pose_features[batch_idx].shape, 'real shape:', i)
+            if num_pose_frames == 0:
+                # print('num_poses == 0')
                 cur_pose_features = pose_features[cur_pose_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_pose_features[0:0]], dim=0)
@@ -441,7 +453,9 @@ class LlavaMetaForCausalLM(ABC):
                 cur_pose_idx += 1
                 continue
 
-            pose_token_indices = [-1] + torch.where(cur_input_ids == POSE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
+            # pose_token_indices = [-1] + torch.where(cur_input_ids == POSE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
+            pose_token_indices = [-1] + [1] + [cur_input_ids.shape[0]]
+            # print('pose_token_indices:', pose_token_indices)
             cur_input_ids_nopose = []
             cur_labels = labels[batch_idx]
             cur_labels_nopose = []
@@ -449,25 +463,33 @@ class LlavaMetaForCausalLM(ABC):
                 cur_input_ids_nopose.append(cur_input_ids[pose_token_indices[i]+1:pose_token_indices[i+1]])
                 cur_labels_nopose.append(cur_labels[pose_token_indices[i]+1:pose_token_indices[i+1]])
             split_sizes = [x.shape[0] for x in cur_labels_nopose]
+            # print('split_sizes:', split_sizes)
             cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_nopose))
             cur_input_embeds_no_pose = torch.split(cur_input_embeds, split_sizes, dim=0)
             cur_new_input_embeds = []
             cur_new_labels = []
 
-            for i in range(num_poses + 1):
+            ### Currently Does not support flexible POSE_TOKEN in the prompt!!!
+            # sub_cur_pose_idx = 0
+
+            num_poses = 1
+            for i in range(len(cur_input_embeds_no_pose)):
                 cur_new_input_embeds.append(cur_input_embeds_no_pose[i])
                 cur_new_labels.append(cur_labels_nopose[i])
                 if i < num_poses:
-                    cur_pose_features = pose_features[cur_pose_idx]
-                    cur_pose_idx += 1
+                    cur_pose_features = pose_features[cur_pose_idx][:num_pose_frames]
                     cur_new_input_embeds.append(cur_pose_features)
                     cur_new_labels.append(torch.full((cur_pose_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
-            cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
 
+            cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
+            # print('cur_new_input_embeds shape:', len(cur_new_input_embeds), cur_new_input_embeds[0].shape, cur_new_input_embeds[1].shape, cur_new_input_embeds[2].shape)
+            # print('cur_new_labels shape:', len(cur_new_labels), cur_new_labels[0].shape, cur_new_labels[1].shape, cur_new_labels[2].shape)
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
 
+            # print('cur_new_input_embeds shape:', cur_new_input_embeds.shape)
+            # print('cur_new_labels shape:', cur_new_labels.shape)
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
 
@@ -481,7 +503,8 @@ class LlavaMetaForCausalLM(ABC):
         max_len = max(x.shape[0] for x in new_input_embeds)
         batch_size = len(new_input_embeds)
 
-        new_input_embeds_padded = []
+        # new_input_embeds_padded = []
+        new_input_embeds_padded = torch.zeros((batch_size, max_len, new_input_embeds[0].shape[1]), dtype=new_input_embeds[0].dtype, device=new_input_embeds[0].device)
         new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
         attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device)
         position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
@@ -489,25 +512,30 @@ class LlavaMetaForCausalLM(ABC):
         for i, (cur_new_embed, cur_new_labels) in enumerate(zip(new_input_embeds, new_labels)):
             cur_len = cur_new_embed.shape[0]
             if getattr(self.config, 'tokenizer_padding_side', 'right') == "left":
-                new_input_embeds_padded.append(torch.cat((
-                    torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device),
-                    cur_new_embed
-                ), dim=0))
+                # new_input_embeds_padded.append(torch.cat((
+                #     torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device),
+                #     cur_new_embed
+                # ), dim=0))
+                new_input_embeds_padded[i, -cur_len:, :] = cur_new_embed
                 if cur_len > 0:
                     new_labels_padded[i, -cur_len:] = cur_new_labels
                     attention_mask[i, -cur_len:] = True
                     position_ids[i, -cur_len:] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
             else:
-                new_input_embeds_padded.append(torch.cat((
-                    cur_new_embed,
-                    torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device)
-                ), dim=0))
+                # new_input_embeds_padded.append(torch.cat((
+                #     cur_new_embed,
+                #     torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device)
+                # ), dim=0))
+                new_input_embeds_padded[i, :cur_len, :] = cur_new_embed
                 if cur_len > 0:
                     new_labels_padded[i, :cur_len] = cur_new_labels
                     attention_mask[i, :cur_len] = True
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
 
-        new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
+        # new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
+
+        print('final new input embeds shape:', new_input_embeds_padded.shape)
+        new_input_embeds = new_input_embeds_padded
 
         if _labels is None:
             new_labels = None

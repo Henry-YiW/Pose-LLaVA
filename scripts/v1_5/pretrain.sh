@@ -45,14 +45,14 @@ python -m llava.train.train_pose \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --bf16 True \
-    --output_dir ./checkpoints/llava-v1.5-7b-pose-pretrain \
+    --output_dir ./checkpoints/llava-v1.5-7b-pose-pretrain-MLP-5 \
     --num_train_epochs 1 \
     --per_device_train_batch_size 32 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 1 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 24000 \
+    --save_steps 100 \
     --save_total_limit 1 \
     --learning_rate 1e-3 \
     --weight_decay 0. \
@@ -64,4 +64,82 @@ python -m llava.train.train_pose \
     --gradient_checkpointing True \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
-    --report_to wandb
+    --report_to wandb \
+    --hidden_dim 4096 \
+    --num_joints 13 \
+    --max_frames 800 \
+    --freeze_backbone True
+
+
+
+python -m llava.train.train_pose \
+    --model_name_or_path lmsys/vicuna-7b-v1.5 \
+    --version plain \
+    --data_path ./llava/pose_llava_data \
+    --pose_tower GCN \
+    --mm_pose_type mlp2x_gelu \
+    --mm_projector_type mlp2x_gelu \
+    --tune_mm_mlp_adapter True \
+    --mm_use_im_start_end False \
+    --mm_use_im_patch_token False \
+    --bf16 True \
+    --output_dir ./checkpoints/llava-v1.5-7b-pose-pretrain-GCN-5 \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 32 \
+    --per_device_eval_batch_size 4 \
+    --gradient_accumulation_steps 1 \
+    --evaluation_strategy "no" \
+    --save_strategy "steps" \
+    --save_steps 100 \
+    --save_total_limit 1 \
+    --learning_rate 1e-3 \
+    --weight_decay 0. \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "cosine" \
+    --logging_steps 1 \
+    --tf32 True \
+    --model_max_length 2048 \
+    --gradient_checkpointing True \
+    --dataloader_num_workers 4 \
+    --lazy_preprocess True \
+    --report_to wandb \
+    --hidden_dim 4096 \
+    --num_joints 13 \
+    --max_frames 512 \
+    --freeze_backbone True
+
+python -m llava.train.train_pose \
+    --model_name_or_path lmsys/vicuna-7b-v1.5 \
+    --version plain \
+    --data_path ./llava/pose_llava_data \
+    --pose_tower STGCN \
+    --mm_pose_type mlp2x_gelu \
+    --mm_projector_type mlp2x_gelu \
+    --tune_mm_mlp_adapter True \
+    --mm_use_im_start_end False \
+    --mm_use_im_patch_token False \
+    --bf16 True \
+    --output_dir ./checkpoints/llava-v1.5-7b-pose-pretrain-STGCN-6 \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 32 \
+    --per_device_eval_batch_size 4 \
+    --gradient_accumulation_steps 1 \
+    --evaluation_strategy "no" \
+    --save_strategy "steps" \
+    --save_steps 100 \
+    --save_total_limit 1 \
+    --learning_rate 1e-3 \
+    --weight_decay 0. \
+    --warmup_ratio 0.03 \
+    --lr_scheduler_type "cosine" \
+    --logging_steps 1 \
+    --tf32 True \
+    --model_max_length 2048 \
+    --gradient_checkpointing True \
+    --dataloader_num_workers 4 \
+    --lazy_preprocess True \
+    --report_to wandb \
+    --hidden_dim 4096 \
+    --num_joints 13 \
+    --max_frames 512 \
+    --freeze_backbone True

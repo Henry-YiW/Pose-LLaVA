@@ -51,9 +51,10 @@ def build_vision_projector(config, delay_load=False, **kwargs):
     raise ValueError(f'Unknown projector type: {projector_type}')
 
 
-def build_pose_projector(config, delay_load=False, **kwargs):
+def build_pose_projector(config, **kwargs):
     projector_type = getattr(config, 'mm_projector_type', 'linear')
 
+    return None
     if projector_type == 'linear':
         return nn.Linear(config.mm_hidden_size, config.hidden_size)
 

@@ -37,6 +37,10 @@ from llava.mm_utils import tokenizer_pose_token
 
 from PIL import Image
 from datasets import load_from_disk
+import evaluate
+import evaluate
+import nltk
+nltk.download("punkt")
 
 local_rank = None
 
@@ -60,12 +64,19 @@ class ModelArguments:
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
     pose_tower: Optional[str] = field(default=None)
+    hidden_dim: Optional[int] = field(default=None)
+    num_joints: Optional[int] = field(default=None)
+    max_frames: Optional[int] = field(default=None)
+    use_joint_type: Optional[bool] = field(default=None)
     mm_pose_type: Optional[str] = field(default='linear')
     mm_projector_type: Optional[str] = field(default='linear')
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    using_gat: Optional[bool] = field(default=False)
+    richer_frequency_representation: Optional[bool] = field(default=False)
+    A: Optional[torch.Tensor] = field(default=None)
 
 
 @dataclass
@@ -189,7 +200,9 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                                    output_dir: str):
     """Collects the state dict and dump to disk."""
 
+    print('safe_save_model_for_hf_trainer step 0')
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
+        print('safe_save_model_for_hf_trainer step 6')
         # Only save Adapter
         keys_to_match = ['mm_projector']
         if getattr(trainer.args, "use_im_start_end", False):
@@ -209,19 +222,26 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
         return
 
+    print('safe_save_model_for_hf_trainer step 1')
     if trainer.deepspeed:
+        print('safe_save_model_for_hf_trainer step 7')
         torch.cuda.synchronize()
         trainer.save_model(output_dir)
         return
-
+    
+    print('safe_save_model_for_hf_trainer step 2')
     state_dict = trainer.model.state_dict()
+
+    print('safe_save_model_for_hf_trainer step 3')
     if trainer.args.should_save:
+        print('safe_save_model_for_hf_trainer step 4')
         cpu_state_dict = {
             key: value.cpu()
             for key, value in state_dict.items()
         }
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
+        print('safe_save_model_for_hf_trainer step 5')
 
 
 def smart_tokenizer_and_embedding_resize(
@@ -612,7 +632,7 @@ def preprocess_plain(
         conversation = DEFAULT_POSE_TOKEN + conversation_lib.default_conversation.sep + source[0]['value'] + conversation_lib.default_conversation.sep + source[1]['value'] + conversation_lib.default_conversation.sep
         conversations.append(conversation)
     # tokenize conversations
-    print('conversations', conversations)
+    # print('conversations from preprocess_plain:', conversations)
     input_ids = [tokenizer_pose_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
     targets = copy.deepcopy(input_ids)
     for target, source in zip(targets, sources):
@@ -625,7 +645,8 @@ def preprocess_plain(
 def preprocess(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+    has_image: bool = False,
+    has_pose: bool = False
 ) -> Dict:
     """
     Given a list of sources, each is a conversation list. This transform:
@@ -679,7 +700,7 @@ class LazySupervisedDataset(Dataset):
         super(LazySupervisedDataset, self).__init__()
         list_data_dict = json.load(open(data_path, "r"))
 
-        rank0_print("Formatting inputs...Skip in lazy mode")
+        # rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
         self.data_args = data_args
@@ -759,12 +780,13 @@ class LazySupervisedDatasetUsingHuggingFace(Dataset):
 
     def __init__(self, data_path: str,
                  tokenizer: transformers.PreTrainedTokenizer,
-                 data_args: DataArguments):
+                 data_args: DataArguments, split: str):
         super(LazySupervisedDatasetUsingHuggingFace, self).__init__()
         self.data_path = data_path
         self.data_args = data_args
+        self.split = split
         print('current working directory:', os.getcwd())
-        list_data_dict = load_from_disk(data_path)[self.data_args.split]
+        list_data_dict = load_from_disk(data_path)[split]
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
@@ -866,7 +888,9 @@ class LazySupervisedDatasetUsingHuggingFace(Dataset):
         data_dict = preprocess(
             sources,
             self.tokenizer,
-            has_image=('image' in self.list_data_dict[i]))
+            has_image=('image' in self.list_data_dict[i]),
+            has_pose=('x' in self.list_data_dict[i])
+            )
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])
@@ -875,13 +899,20 @@ class LazySupervisedDatasetUsingHuggingFace(Dataset):
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
         elif 'x' in self.list_data_dict[i]:
-            datum = self.list_data_dict[i]
-            bboxData = torch.tensor(datum['bbox'], dtype=torch.float32)
-            bboxData = bboxData.unsqueeze(1).expand(datum['x'].shape[0], datum['x'].shape[1], -1)
-            data_dict['pose'] = torch.stack([torch.tensor(datum['x'], dtype=torch.float32), torch.tensor(datum['y'], dtype=torch.float32)], dim=-1)
-            data_dict['pose'] = torch.cat([data_dict['pose'], bboxData], dim=-1)
-            data_dict['visibility'] = torch.tensor(datum['visibility'], dtype=torch.int32)
-            print('pose shape from dataset loader:', data_dict['pose'].shape)
+            try: 
+                datum = self.list_data_dict[i]
+                xData = torch.tensor(datum['x'], dtype=torch.float32)
+                yData = torch.tensor(datum['y'], dtype=torch.float32)
+                visibilityData = torch.tensor(datum['visibility'], dtype=torch.int32)
+                bboxData = torch.tensor(datum['bbox'], dtype=torch.float32)
+                bboxData = bboxData.unsqueeze(1).expand(xData.shape[0], xData.shape[1], -1)
+                data_dict['pose'] = torch.stack([xData, yData], dim=-1)
+                data_dict['pose'] = torch.cat([data_dict['pose'], bboxData], dim=-1)
+                data_dict['visibility'] = visibilityData
+            except Exception as e:
+                print('Datum has Issue, ID:', datum['id'])
+                return None
+            # print('pose shape from dataset loader:', data_dict['pose'].shape)
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
@@ -945,6 +976,19 @@ class ActionPoseDataset(Dataset):
 
         return sample
 
+def debug_input_ids(input_ids, vocab_size):
+    invalid_mask = (input_ids < 0) | (input_ids >= vocab_size)
+
+    if invalid_mask.any():
+        print("Invalid token IDs found!")
+        indices = torch.nonzero(invalid_mask, as_tuple=False)
+        for idx in indices:
+            b, pos = idx.tolist()
+            print(f"  → input_ids[{b}, {pos}] = {input_ids[b, pos].item()}")
+        return True
+    else:
+        print("All token IDs are valid.")
+        return False
 
 
 @dataclass
@@ -953,7 +997,15 @@ class DataCollatorForSupervisedDataset(object):
 
     tokenizer: transformers.PreTrainedTokenizer
 
+    def __init__(self, *args, **kwargs):
+        # super().__init__(*args, **kwargs)
+        # self.vocab_size = vocab_size
+        self.tokenizer = kwargs['tokenizer']
+        self.max_frames = kwargs['max_frames']
+        pass
+
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        instances = [instance for instance in instances if instance is not None and ('pose' not in instance or instance['pose'].shape[0] <= self.max_frames)]
         input_ids, labels = tuple([instance[key] for instance in instances]
                                   for key in ("input_ids", "labels"))
         input_ids = torch.nn.utils.rnn.pad_sequence(
@@ -965,6 +1017,9 @@ class DataCollatorForSupervisedDataset(object):
                                                  padding_value=IGNORE_INDEX)
         input_ids = input_ids[:, :self.tokenizer.model_max_length]
         labels = labels[:, :self.tokenizer.model_max_length]
+        # print('shape of input_ids', input_ids.shape)
+        # print('shape of labels', labels.shape)
+        # raise ValueError('stop here')
         batch = dict(
             input_ids=input_ids,
             labels=labels,
@@ -980,10 +1035,62 @@ class DataCollatorForSupervisedDataset(object):
 
         if 'pose' in instances[0]:
             poses = [instance['pose'] for instance in instances]
-            if all(x is not None and x.shape == poses[0].shape for x in poses):
-                batch['poses'] = torch.stack(poses)
+            frame_lengths = [ pose.shape[0] for pose in poses ]
+            max_frame_length = max(frame_lengths)
+            padded = torch.full((len(poses), max_frame_length, poses[0].shape[1], poses[0].shape[2]), IGNORE_INDEX)
+            # print('max frame length pose', max_frame_length)
+            for index, frame_length in enumerate(frame_lengths):
+                padded[index, :frame_length, :, :] = poses[index]
+                # padded[index, frame_length:] = IGNORE_INDEX
+            batch['pose_attention_mask'] = torch.ones_like(padded)
+            batch['pose_attention_mask'][padded == IGNORE_INDEX] = 0
+            batch['pose_attention_mask'] = batch['pose_attention_mask'][:, :, 0, 0]
+            # print('pose attention mask shape', batch['pose_attention_mask'].shape)
+            # print('pose attention mask sample', batch['pose_attention_mask'][2])
+            # print('pose sample', padded[2])
+            if all(x is not None and x.shape == padded[0].shape for x in padded):
+                # print('pose shape from dataset loader:', padded.shape)
+                batch['poses'] = padded
             else:
                 batch['poses'] = poses
+
+        if 'visibility' in instances[0]:
+            visibilities = [instance['visibility'] for instance in instances]
+            frame_lengths = [ visibility.shape[0] for visibility in visibilities ]
+            max_frame_length = max(frame_lengths)
+            padded = torch.zeros(len(visibilities), max_frame_length, visibilities[0].shape[1])
+            # print('max frame length visibility', max_frame_length)
+            for index, frame_length in enumerate(frame_lengths):
+                padded[index, :frame_length, :] = visibilities[index]
+                # padded[index, frame_length:] = 0
+            
+            if all(x is not None and x.shape == padded[0].shape for x in padded):
+                # print('visibility shape from dataset loader:', padded.shape)
+                batch['visibilities'] = padded
+            else:
+                batch['visibilities'] = visibilities
+
+        # if 'pose' in instances[0]:
+        #     poses = [instance['pose'] for instance in instances]
+
+        #     if not all(x is not None and x.shape == poses[0].shape for x in poses):
+        #         # print('pose shape from dataset loader:', padded.shape)
+        #         batch['poses'] = torch.cat(poses, dim=0)
+        #     else:
+        #         batch['poses'] = torch.stack(poses)
+
+        # if 'visibility' in instances[0]:
+        #     visibilities = [instance['visibility'] for instance in instances]
+            
+        #     if not all(x is not None and x.shape == visibilities[0].shape for x in visibilities):
+        #         # print('visibility shape from dataset loader:', padded.shape)
+        #         batch['visibilities'] = torch.cat(visibilities, dim=0)
+        #     else:
+                batch['visibilities'] = torch.stack(visibilities)
+
+        # input_ids = batch['input_ids']
+        # if debug_input_ids(input_ids, self.tokenizer.vocab_size):
+        #     raise ValueError("Invalid token IDs found in input_ids")
         return batch
 
 
@@ -995,10 +1102,13 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
     #                             data_args=data_args)
     train_dataset = LazySupervisedDatasetUsingHuggingFace(tokenizer=tokenizer,
                                 data_path=data_args.data_path,
-                                data_args=data_args)
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+                                data_args=data_args, split='train')
+    val_dataset = LazySupervisedDatasetUsingHuggingFace(tokenizer=tokenizer,
+                                data_path=data_args.data_path,
+                                data_args=data_args, split='validation')
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, max_frames=data_args.max_frames)
     return dict(train_dataset=train_dataset,
-                eval_dataset=None,
+                eval_dataset=val_dataset,
                 data_collator=data_collator)
 
 
@@ -1008,6 +1118,7 @@ def train(attn_implementation=None):
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    # print('training_args', training_args)
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
@@ -1057,6 +1168,8 @@ def train(attn_implementation=None):
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
             **bnb_model_from_pretrained_args
         )
+        # print('model.config 1', model.config)
+        # print('model.generation_config 1', model.generation_config)
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -1068,6 +1181,7 @@ def train(attn_implementation=None):
     model.config.use_cache = False
 
     if model_args.freeze_backbone:
+        print('Freezing Backbone')
         model.model.requires_grad_(False)
 
     if training_args.bits in [4, 8]:
@@ -1168,7 +1282,7 @@ def train(attn_implementation=None):
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
-
+    
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
         for name, module in model.named_modules():
@@ -1182,8 +1296,21 @@ def train(attn_implementation=None):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
+    # print('model.config 2', model.config)
+    # print('model.generation_config 2', model.generation_config)
+    data_args.max_frames = model_args.max_frames
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
+    
+    model_args.A = data_module['train_dataset'].build_penn_action_adj()
+    print('model_args.A', model_args.A)
+    if model_args.pose_tower is not None:
+        model.get_model().initialize_pose_modules(
+            model_args=model_args,
+            fsdp=training_args.fsdp,
+        )
+
+    model.generation_config.do_sample = True
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
@@ -1193,9 +1320,11 @@ def train(attn_implementation=None):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
+    
+    print('Saving Model')
     trainer.save_state()
-
-    model.config.use_cache = True
+    print('Saving Model Done')
+    # model.config.use_cache = True
 
     if training_args.lora_enable:
         state_dict = get_peft_state_maybe_zero_3(
@@ -1211,6 +1340,242 @@ def train(attn_implementation=None):
     else:
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)
+
+    print('Testing Model')
+    test(model, tokenizer, data_module['eval_dataset'], model.generation_config, output_file=os.path.join(training_args.output_dir, "generated_outputs.json"), max_frames=model_args.max_frames)
+    print('Testing Model Done')
+
+# def test(model, tokenizer, eval_dataset, generation_config):
+
+#     # === Load metrics ===
+#     rouge = evaluate.load("rouge")
+#     bleu = evaluate.load("bleu")
+#     exact_match_count = 0
+
+#     # === Generation loop ===
+#     predictions = []
+#     references = []
+
+#     for sample in eval_dataset:
+#         input_text = sample["input"]
+#         reference_text = sample["reference"]
+
+#         inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+
+#         with torch.no_grad():
+#             output_ids = model.generate(
+#                 **inputs,
+#                 generation_config=generation_config,
+#                 max_new_tokens=128,  # or your own value
+#                 do_sample=False  # usually use deterministic eval
+#             )
+
+#         output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+
+#         predictions.append(output_text)
+#         references.append(reference_text.strip())
+
+#         if output_text.strip() == reference_text.strip():
+#             exact_match_count += 1
+
+#     # === Compute metrics ===
+#     rouge_result = rouge.compute(predictions=predictions, references=references)
+#     bleu_result = bleu.compute(predictions=predictions, references=[[ref] for ref in references])
+#     exact_match_score = exact_match_count / len(eval_dataset)
+
+#     # === Print results ===
+#     print("Evaluation Results:")
+#     print(f"ROUGE-L: {rouge_result['rougeL']:.4f}")
+#     print(f"BLEU:    {bleu_result['bleu']:.4f}")
+#     print(f"Exact Match: {exact_match_score:.4f}")
+
+import torch
+import torch.nn.functional as F
+
+def manual_generate(
+    model,
+    tokenizer,
+    input_ids: torch.LongTensor,
+    poses: torch.FloatTensor = None,
+    visibilities: torch.FloatTensor = None,
+    pose_attention_mask: torch.LongTensor = None,
+    max_new_tokens=50,
+    temperature=1.0,
+    top_p=0.9,
+    eos_token_id=None,
+    device='cuda',
+    max_frames=None,
+):
+    
+    if max_frames is not None and poses.shape[1] > max_frames:
+        poses = poses[:, :max_frames, :, :]
+        visibilities = visibilities[:, :max_frames, :]
+        pose_attention_mask = pose_attention_mask[:, :max_frames, :] if pose_attention_mask is not None else None
+
+    model.eval()
+    input_ids = input_ids.to(device)
+    poses = poses.to(device) if poses is not None else None
+    visibilities = visibilities.to(device) if visibilities is not None else None
+    pose_attention_mask = pose_attention_mask.to(device) if pose_attention_mask is not None else None
+
+    # Initial input (first forward call)
+    with torch.inference_mode():
+        outputs = model(
+            input_ids=input_ids,
+            poses=poses,
+            visibilities=visibilities,
+            pose_attention_mask=pose_attention_mask,
+            use_cache=True,
+            return_dict=True,
+        )
+        logits = outputs.logits[:, -1, :]  # last token's logits
+        past_key_values = outputs.past_key_values
+
+    generated = []
+
+    for step in range(max_new_tokens):
+        # Sample next token
+        probs = F.softmax(logits / temperature, dim=-1)
+
+        # Top-p sampling
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_indices_to_keep = cumulative_probs <= top_p
+        sorted_indices_to_keep[..., 0] = 1  # always keep at least one
+
+        filtered_logits = torch.full_like(logits, float('-inf'))
+        filtered_logits.scatter_(
+            dim=-1,
+            index=sorted_indices,
+            src=torch.where(sorted_indices_to_keep, logits, torch.tensor(float('-inf'), device=logits.device))
+        )
+
+        next_token = torch.argmax(filtered_logits, dim=-1)
+
+        generated.append(next_token.item())
+
+        # If EOS token is generated, stop
+        if eos_token_id is not None and next_token.item() == eos_token_id:
+            break
+
+        # Next step: pass new token with cached KV
+        with torch.no_grad():
+            outputs = model(
+                input_ids=next_token.unsqueeze(0),
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            logits = outputs.logits[:, -1, :]
+            past_key_values = outputs.past_key_values
+
+    return tokenizer.decode(generated, skip_special_tokens=True)
+
+
+def test(model, tokenizer, eval_dataset, generation_config, output_file="generated_outputs.jsonl", max_frames=None):
+    rouge = evaluate.load("rouge")
+    bleu = evaluate.load("bleu")
+    exact_match = 0
+
+    predictions = []
+    references = []
+
+    # Open file to write outputs
+    with open(output_file, "w", encoding="utf-8") as f_out:
+        for i in range(len(eval_dataset)):
+            sample = eval_dataset[i]
+            if sample is None:
+                continue
+
+            valid_input_ids = [token_id for token_id in sample["input_ids"] if 0 <= token_id < tokenizer.vocab_size]
+            input_text = tokenizer.decode(valid_input_ids, skip_special_tokens=True)
+            # print('input_text', input_text)
+            valid_labels = [token_id for token_id in sample["labels"] if 0 <= token_id < tokenizer.vocab_size]
+            reference_text = tokenizer.decode(valid_labels, skip_special_tokens=True)
+            # print('reference_text', reference_text)
+
+            prompt = 'Recognize the action from this pose sequence.'
+            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+            # sample['pose_attention_mask'] = torch.ones_like(padded)
+            # sample['pose_attention_mask'][padded == IGNORE_INDEX] = 0
+            # sample['pose_attention_mask'] = batch['pose_attention_mask'][:, :, 0, 0]
+            # model.eval()
+            with torch.inference_mode():
+                # output_ids = model.generate(
+                #     inputs=inputs['input_ids'],
+                #     generation_config=generation_config,
+                #     max_new_tokens=128,
+                #     do_sample=True,
+                #     poses=sample['pose'].unsqueeze(0).to(model.device),
+                #     visibilities=sample['visibility'].unsqueeze(0).to(model.device),
+                #     # pose_attention_mask=sample['pose_attention_mask']
+                #     use_cache=True
+                # )
+                output_text = manual_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    input_ids=inputs['input_ids'],
+                    poses=sample['pose'].unsqueeze(0).to(model.device),
+                    visibilities=sample['visibility'].unsqueeze(0).to(model.device),
+                    max_frames=max_frames,
+                )
+
+            # output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+
+            # Save for metrics
+            print('output_text', output_text)
+            predictions.append(output_text.strip())
+            references.append(reference_text.strip())
+
+            if output_text.strip() == reference_text.strip():
+                exact_match += 1
+
+            # Write to file
+            f_out.write(json.dumps({
+                "input": prompt.strip(),
+                "reference": reference_text.strip(),
+                "prediction": output_text
+            }, ensure_ascii=False) + "\n")
+
+    # Compute metrics
+    rouge_result = rouge.compute(predictions=predictions, references=references)
+    bleu_result = bleu.compute(predictions=predictions, references=[[r] for r in references])
+    em_score = exact_match / len(predictions)
+
+    # Print metrics
+    print("Evaluation Results:")
+    print(f"ROUGE-L: {rouge_result['rougeL']:.4f}")
+    print(f"BLEU:    {bleu_result['bleu']:.4f}")
+    print(f"Exact Match: {em_score:.4f}")
+
+    print(f"\nSaved outputs to: {output_file}")
+
+def calculate_success_rate(file_path):
+    with open(file_path, "r") as f:
+        data = [json.loads(line) for line in f if line.strip()]
+
+    # Updated label extraction to handle longer/messy prediction format
+    def extract_labels(entry):
+        ref = entry["reference"].split("is")[-1].strip().strip(".")
+        preds = [
+            line.split("is")[-1].strip().strip(".")
+            for line in entry["prediction"].split("\n")
+            if "is" in line
+        ]
+        # Count how many of the predictions match the reference
+        return ref, preds
+
+    # Calculate accuracy
+    total = len(data)
+    correct = 0
+    for entry in data:
+        ref, preds = extract_labels(entry)
+        if ref in preds:
+            correct += 1
+
+    success_rate = correct / total * 100
+    success_rate
 
 
 if __name__ == "__main__":
